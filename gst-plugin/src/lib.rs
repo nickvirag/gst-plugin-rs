@@ -47,6 +47,9 @@ pub mod base_src;
 pub mod base_sink;
 #[macro_use]
 pub mod base_transform;
+#[cfg(any(feature = "v1_14", feature = "dox"))]
+#[macro_use]
+pub mod aggregator;
 
 #[macro_use]
 pub mod pad;
