@@ -17,6 +17,7 @@
 
 use either::Either;
 
+use futures::executor::block_on;
 use futures::future::BoxFuture;
 use futures::lock::{Mutex, MutexGuard};
 use futures::prelude::*;
@@ -54,7 +55,6 @@ use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, FromRawSocket, IntoRawSocket, RawSocket};
 
-use crate::block_on;
 use crate::runtime::prelude::*;
 use crate::runtime::{Context, PadSrc, PadSrcRef};
 
@@ -295,14 +295,14 @@ static PROPERTIES: [subclass::Property; 10] = [
 
 #[derive(Debug)]
 struct UdpReaderInner {
-    socket: tokio::net::udp::UdpSocket,
+    socket: tokio::net::UdpSocket,
 }
 
 #[derive(Debug)]
 pub struct UdpReader(Arc<Mutex<UdpReaderInner>>);
 
 impl UdpReader {
-    fn new(socket: tokio::net::udp::UdpSocket) -> Self {
+    fn new(socket: tokio::net::UdpSocket) -> Self {
         UdpReader(Arc::new(Mutex::new(UdpReaderInner { socket })))
     }
 }
@@ -506,7 +506,7 @@ impl PadSrcHandler for UdpSrcPadHandler {
 
         let ret = match event.view() {
             EventView::FlushStart(..) => {
-                let _ = block_on!(udpsrc.pause(element));
+                let _ = block_on(udpsrc.pause(element));
                 true
             }
             EventView::FlushStop(..) => {
@@ -514,7 +514,7 @@ impl PadSrcHandler for UdpSrcPadHandler {
                 if res == Ok(gst::StateChangeSuccess::Success) && state == gst::State::Playing
                     || res == Ok(gst::StateChangeSuccess::Async) && pending == gst::State::Playing
                 {
-                    let _ = block_on!(udpsrc.start(element));
+                    let _ = block_on(udpsrc.start(element));
                 }
                 true
             }
@@ -552,7 +552,7 @@ impl PadSrcHandler for UdpSrcPadHandler {
                 true
             }
             QueryView::Caps(ref mut q) => {
-                let inner = block_on!(self.lock());
+                let inner = block_on(self.lock());
                 let caps = if let Some(ref caps) = inner.configured_caps {
                     q.get_filter()
                         .map(|f| f.intersect_with_mode(caps, gst::CapsIntersectMode::First))
@@ -636,13 +636,17 @@ impl UdpSrc {
                 socket = wrapped_socket.get()
             }
 
-            let socket = tokio::net::UdpSocket::from_std(socket, context.reactor_handle())
-                .map_err(|err| {
-                    gst_error_msg!(
-                        gst::ResourceError::OpenRead,
-                        ["Failed to setup socket for tokio: {}", err]
-                    )
-                })?;
+            let socket = context
+                .spawn(async move {
+                    tokio::net::UdpSocket::from_std(socket).map_err(|err| {
+                        gst_error_msg!(
+                            gst::ResourceError::OpenRead,
+                            ["Failed to setup socket for tokio: {}", err]
+                        )
+                    })
+                })
+                .await
+                .expect("Failed to spawn UdpSocket::from_std")?;
 
             settings.used_socket = Some(wrapped_socket.clone());
 
@@ -669,11 +673,10 @@ impl UdpSrc {
 
             // TODO: TTL, multicast loopback, etc
             let saddr = if addr.is_multicast() {
-                // TODO: Use ::unspecified() constructor once stable
                 let bind_addr = if addr.is_ipv4() {
-                    IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))
+                    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
                 } else {
-                    IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0))
+                    IpAddr::V6(Ipv6Addr::UNSPECIFIED)
                 };
 
                 let saddr = SocketAddr::new(bind_addr, port as u16);
@@ -731,13 +734,17 @@ impl UdpSrc {
                 )
             })?;
 
-            let socket = tokio::net::UdpSocket::from_std(socket, context.reactor_handle())
-                .map_err(|err| {
-                    gst_error_msg!(
-                        gst::ResourceError::OpenRead,
-                        ["Failed to setup socket for tokio: {}", err]
-                    )
-                })?;
+            let socket = context
+                .spawn(async move {
+                    tokio::net::UdpSocket::from_std(socket).map_err(|err| {
+                        gst_error_msg!(
+                            gst::ResourceError::OpenRead,
+                            ["Failed to setup socket for tokio: {}", err]
+                        )
+                    })
+                })
+                .await
+                .expect("Failed to spawn UdpSocket::from_std")?;
 
             if addr.is_multicast() {
                 // TODO: Multicast interface configuration, going to be tricky
@@ -821,16 +828,19 @@ impl UdpSrc {
         let buffer_pool = gst::BufferPool::new();
         let mut config = buffer_pool.get_config();
         config.set_params(None, settings.mtu, 0, 0);
-        buffer_pool.set_config(config).map_err(|_| {
+        buffer_pool.set_config(config).map_err(|err| {
             gst_error_msg!(
                 gst::ResourceError::Settings,
-                ["Failed to configure buffer pool"]
+                ["Failed to configure buffer pool {:?}", err]
             )
         })?;
 
         let socket = Socket::new(element.upcast_ref(), UdpReader::new(socket), buffer_pool);
-        let socket_stream = socket.prepare().await.map_err(|_| {
-            gst_error_msg!(gst::ResourceError::OpenRead, ["Failed to prepare socket"])
+        let socket_stream = socket.prepare().await.map_err(|err| {
+            gst_error_msg!(
+                gst::ResourceError::OpenRead,
+                ["Failed to prepare socket {:?}", err]
+            )
         })?;
 
         {
@@ -984,27 +994,27 @@ impl ObjectImpl for UdpSrc {
 
         match *prop {
             subclass::Property("address", ..) => {
-                let mut settings = block_on!(self.settings.lock());
+                let mut settings = block_on(self.settings.lock());
                 settings.address = value.get().expect("type checked upstream");
             }
             subclass::Property("port", ..) => {
-                let mut settings = block_on!(self.settings.lock());
+                let mut settings = block_on(self.settings.lock());
                 settings.port = value.get_some().expect("type checked upstream");
             }
             subclass::Property("reuse", ..) => {
-                let mut settings = block_on!(self.settings.lock());
+                let mut settings = block_on(self.settings.lock());
                 settings.reuse = value.get_some().expect("type checked upstream");
             }
             subclass::Property("caps", ..) => {
-                let mut settings = block_on!(self.settings.lock());
+                let mut settings = block_on(self.settings.lock());
                 settings.caps = value.get().expect("type checked upstream");
             }
             subclass::Property("mtu", ..) => {
-                let mut settings = block_on!(self.settings.lock());
+                let mut settings = block_on(self.settings.lock());
                 settings.mtu = value.get_some().expect("type checked upstream");
             }
             subclass::Property("socket", ..) => {
-                let mut settings = block_on!(self.settings.lock());
+                let mut settings = block_on(self.settings.lock());
                 settings.socket = value
                     .get::<gio::Socket>()
                     .expect("type checked upstream")
@@ -1014,18 +1024,18 @@ impl ObjectImpl for UdpSrc {
                 unreachable!();
             }
             subclass::Property("context", ..) => {
-                let mut settings = block_on!(self.settings.lock());
+                let mut settings = block_on(self.settings.lock());
                 settings.context = value
                     .get()
                     .expect("type checked upstream")
                     .unwrap_or_else(|| "".into());
             }
             subclass::Property("context-wait", ..) => {
-                let mut settings = block_on!(self.settings.lock());
+                let mut settings = block_on(self.settings.lock());
                 settings.context_wait = value.get_some().expect("type checked upstream");
             }
             subclass::Property("retrieve-sender-address", ..) => {
-                let mut settings = block_on!(self.settings.lock());
+                let mut settings = block_on(self.settings.lock());
                 settings.retrieve_sender_address = value.get_some().expect("type checked upstream");
             }
             _ => unimplemented!(),
@@ -1037,27 +1047,27 @@ impl ObjectImpl for UdpSrc {
 
         match *prop {
             subclass::Property("address", ..) => {
-                let settings = block_on!(self.settings.lock());
+                let settings = block_on(self.settings.lock());
                 Ok(settings.address.to_value())
             }
             subclass::Property("port", ..) => {
-                let settings = block_on!(self.settings.lock());
+                let settings = block_on(self.settings.lock());
                 Ok(settings.port.to_value())
             }
             subclass::Property("reuse", ..) => {
-                let settings = block_on!(self.settings.lock());
+                let settings = block_on(self.settings.lock());
                 Ok(settings.reuse.to_value())
             }
             subclass::Property("caps", ..) => {
-                let settings = block_on!(self.settings.lock());
+                let settings = block_on(self.settings.lock());
                 Ok(settings.caps.to_value())
             }
             subclass::Property("mtu", ..) => {
-                let settings = block_on!(self.settings.lock());
+                let settings = block_on(self.settings.lock());
                 Ok(settings.mtu.to_value())
             }
             subclass::Property("socket", ..) => {
-                let settings = block_on!(self.settings.lock());
+                let settings = block_on(self.settings.lock());
                 Ok(settings
                     .socket
                     .as_ref()
@@ -1065,7 +1075,7 @@ impl ObjectImpl for UdpSrc {
                     .to_value())
             }
             subclass::Property("used-socket", ..) => {
-                let settings = block_on!(self.settings.lock());
+                let settings = block_on(self.settings.lock());
                 Ok(settings
                     .used_socket
                     .as_ref()
@@ -1073,15 +1083,15 @@ impl ObjectImpl for UdpSrc {
                     .to_value())
             }
             subclass::Property("context", ..) => {
-                let settings = block_on!(self.settings.lock());
+                let settings = block_on(self.settings.lock());
                 Ok(settings.context.to_value())
             }
             subclass::Property("context-wait", ..) => {
-                let settings = block_on!(self.settings.lock());
+                let settings = block_on(self.settings.lock());
                 Ok(settings.context_wait.to_value())
             }
             subclass::Property("retrieve-sender-address", ..) => {
-                let settings = block_on!(self.settings.lock());
+                let settings = block_on(self.settings.lock());
                 Ok(settings.retrieve_sender_address.to_value())
             }
             _ => unimplemented!(),
@@ -1107,16 +1117,16 @@ impl ElementImpl for UdpSrc {
 
         match transition {
             gst::StateChange::NullToReady => {
-                block_on!(self.prepare(element)).map_err(|err| {
+                block_on(self.prepare(element)).map_err(|err| {
                     element.post_error_message(&err);
                     gst::StateChangeError
                 })?;
             }
             gst::StateChange::PlayingToPaused => {
-                block_on!(self.pause(element)).map_err(|_| gst::StateChangeError)?;
+                block_on(self.pause(element)).map_err(|_| gst::StateChangeError)?;
             }
             gst::StateChange::ReadyToNull => {
-                block_on!(self.unprepare(element)).map_err(|_| gst::StateChangeError)?;
+                block_on(self.unprepare(element)).map_err(|_| gst::StateChangeError)?;
             }
             _ => (),
         }
@@ -1128,10 +1138,10 @@ impl ElementImpl for UdpSrc {
                 success = gst::StateChangeSuccess::NoPreroll;
             }
             gst::StateChange::PausedToPlaying => {
-                block_on!(self.start(element)).map_err(|_| gst::StateChangeError)?;
+                block_on(self.start(element)).map_err(|_| gst::StateChangeError)?;
             }
             gst::StateChange::PausedToReady => {
-                block_on!(async {
+                block_on(async {
                     self.src_pad_handler.lock().await.need_initial_events = true;
                 });
             }
