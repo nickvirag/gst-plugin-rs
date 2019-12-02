@@ -17,7 +17,12 @@
 // Boston, MA 02110-1335, USA.
 
 use either::Either;
-use futures::{channel::oneshot, prelude::*};
+
+use futures::channel::oneshot;
+use futures::future::BoxFuture;
+use futures::lock::Mutex;
+use futures::prelude::*;
+use futures::select;
 
 use gst;
 use gst::prelude::*;
@@ -26,13 +31,7 @@ use gst::{gst_debug, gst_error};
 use lazy_static::lazy_static;
 
 use std::io;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::task::{self, Poll};
-
-use tokio_executor::current_thread as tokio_current_thread;
-
-use super::iocontext::*;
+use std::sync::Arc;
 
 lazy_static! {
     static ref SOCKET_CAT: gst::DebugCategory = gst::DebugCategory::new(
@@ -42,184 +41,120 @@ lazy_static! {
     );
 }
 
+#[derive(Debug)]
 pub struct Socket<T: SocketRead + 'static>(Arc<Mutex<SocketInner<T>>>);
-
-#[derive(PartialEq, Eq, Debug)]
-enum SocketState {
-    Unscheduled,
-    Scheduled,
-    Running,
-    Shutdown,
-}
 
 pub trait SocketRead: Send + Unpin {
     const DO_TIMESTAMP: bool;
 
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<(usize, Option<std::net::SocketAddr>)>>;
+    fn read<'buf>(
+        &self,
+        buffer: &'buf mut [u8],
+    ) -> BoxFuture<'buf, io::Result<(usize, Option<std::net::SocketAddr>)>>;
 }
 
+#[derive(PartialEq, Eq, Debug)]
+enum SocketState {
+    Paused,
+    Prepared,
+    Started,
+    Unprepared,
+}
+
+#[derive(Debug)]
 struct SocketInner<T: SocketRead + 'static> {
-    element: gst::Element,
     state: SocketState,
-    reader: Pin<Box<T>>,
+    element: gst::Element,
+    reader: Option<T>,
     buffer_pool: gst::BufferPool,
-    waker: Option<task::Waker>,
-    shutdown_receiver: Option<oneshot::Receiver<()>>,
     clock: Option<gst::Clock>,
     base_time: Option<gst::ClockTime>,
+    wake_sender: Option<oneshot::Sender<()>>,
+}
+
+impl<T: SocketRead + 'static> SocketInner<T> {
+    fn wake(&mut self) {
+        self.wake_sender.take();
+    }
 }
 
 impl<T: SocketRead + 'static> Socket<T> {
     pub fn new(element: &gst::Element, reader: T, buffer_pool: gst::BufferPool) -> Self {
         Socket(Arc::new(Mutex::new(SocketInner::<T> {
+            state: SocketState::Unprepared,
             element: element.clone(),
-            state: SocketState::Unscheduled,
-            reader: Pin::new(Box::new(reader)),
+            reader: Some(reader),
             buffer_pool,
-            waker: None,
-            shutdown_receiver: None,
             clock: None,
             base_time: None,
+            wake_sender: None,
         })))
     }
 
-    pub fn schedule<F, G, Fut>(
-        &self,
-        io_context: &IOContext,
-        func: F,
-        err_func: G,
-    ) -> Result<(), ()>
-    where
-        F: Fn((gst::Buffer, Option<std::net::SocketAddr>)) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<(), gst::FlowError>> + Send + 'static,
-        G: FnOnce(Either<gst::FlowError, io::Error>) + Send + 'static,
-    {
-        // Ready->Paused
-        //
-        // Need to wait for a possible shutdown to finish first
-        // spawn() on the reactor, change state to Scheduled
-        let stream = SocketStream::<T>(self.clone(), None);
+    pub async fn prepare(&self) -> Result<SocketStream<T>, ()> {
+        // Null->Ready
+        let mut inner = self.0.lock().await;
+        if inner.state != SocketState::Unprepared {
+            gst_debug!(SOCKET_CAT, obj: &inner.element, "Socket already prepared");
+            return Ok(SocketStream::<T>::new(self));
+        }
+        gst_debug!(SOCKET_CAT, obj: &inner.element, "Preparing socket");
 
-        let mut inner = self.0.lock().unwrap();
-        gst_debug!(SOCKET_CAT, obj: &inner.element, "Scheduling socket");
-        if inner.state == SocketState::Scheduled {
-            gst_debug!(SOCKET_CAT, obj: &inner.element, "Socket already scheduled");
+        inner.buffer_pool.set_active(true).map_err(|err| {
+            gst_error!(SOCKET_CAT, obj: &inner.element, "Failed to prepare socket: {}", err);
+        })?;
+        inner.state = SocketState::Prepared;
+
+        Ok(SocketStream::<T>::new(self))
+    }
+
+    pub async fn start(&self, clock: Option<gst::Clock>, base_time: Option<gst::ClockTime>) {
+        // Paused->Playing
+        let mut inner = self.0.lock().await;
+        assert_ne!(SocketState::Unprepared, inner.state);
+        if inner.state == SocketState::Started {
+            gst_debug!(SOCKET_CAT, obj: &inner.element, "Socket already started");
+            return;
+        }
+
+        gst_debug!(SOCKET_CAT, obj: &inner.element, "Starting socket");
+        inner.clock = clock;
+        inner.base_time = base_time;
+        inner.state = SocketState::Started;
+        inner.wake();
+    }
+
+    pub async fn pause(&self) {
+        // Playing->Paused
+        let mut inner = self.0.lock().await;
+        assert_ne!(SocketState::Unprepared, inner.state);
+        if inner.state != SocketState::Started {
+            gst_debug!(SOCKET_CAT, obj: &inner.element, "Socket not started");
+            return;
+        }
+
+        gst_debug!(SOCKET_CAT, obj: &inner.element, "Pausing socket");
+        inner.clock = None;
+        inner.base_time = None;
+        inner.state = SocketState::Paused;
+        inner.wake();
+    }
+
+    pub async fn unprepare(&self) -> Result<(), ()> {
+        // Ready->Null
+        let mut inner = self.0.lock().await;
+        assert_ne!(SocketState::Started, inner.state);
+        if inner.state == SocketState::Unprepared {
+            gst_debug!(SOCKET_CAT, obj: &inner.element, "Socket already unprepared");
             return Ok(());
         }
 
-        assert_eq!(inner.state, SocketState::Unscheduled);
-        inner.state = SocketState::Scheduled;
-        if inner.buffer_pool.set_active(true).is_err() {
-            gst_error!(SOCKET_CAT, obj: &inner.element, "Failed to activate buffer pool");
-            return Err(());
-        }
+        inner.buffer_pool.set_active(false).map_err(|err| {
+            gst_error!(SOCKET_CAT, obj: &inner.element, "Failed to unprepare socket: {}", err);
+        })?;
+        inner.state = SocketState::Unprepared;
 
-        let (sender, receiver) = oneshot::channel();
-        inner.shutdown_receiver = Some(receiver);
-
-        let element_clone = inner.element.clone();
-        io_context.spawn(
-            stream
-                .try_for_each(move |(buffer, saddr)| {
-                    func((buffer, saddr)).into_future().map_err(Either::Left)
-                })
-                .then(move |res| {
-                    gst_debug!(
-                        SOCKET_CAT,
-                        obj: &element_clone,
-                        "Socket finished: {:?}",
-                        res
-                    );
-
-                    if let Err(err) = res {
-                        err_func(err);
-                    }
-
-                    let _ = sender.send(());
-
-                    future::ready(())
-                }),
-        );
         Ok(())
-    }
-
-    pub fn unpause(&self, clock: Option<gst::Clock>, base_time: Option<gst::ClockTime>) {
-        // Paused->Playing
-        //
-        // Change state to Running and signal task
-        let mut inner = self.0.lock().unwrap();
-        gst_debug!(SOCKET_CAT, obj: &inner.element, "Unpausing socket");
-        if inner.state == SocketState::Running {
-            gst_debug!(SOCKET_CAT, obj: &inner.element, "Socket already unpaused");
-            return;
-        }
-
-        assert_eq!(inner.state, SocketState::Scheduled);
-        inner.state = SocketState::Running;
-        inner.clock = clock;
-        inner.base_time = base_time;
-
-        if let Some(waker) = inner.waker.take() {
-            waker.wake();
-        }
-    }
-
-    pub fn pause(&self) {
-        // Playing->Paused
-        //
-        // Change state to Scheduled and signal task
-
-        let mut inner = self.0.lock().unwrap();
-        gst_debug!(SOCKET_CAT, obj: &inner.element, "Pausing socket");
-        if inner.state == SocketState::Scheduled {
-            gst_debug!(SOCKET_CAT, obj: &inner.element, "Socket already paused");
-            return;
-        }
-
-        assert_eq!(inner.state, SocketState::Running);
-        inner.state = SocketState::Scheduled;
-        inner.clock = None;
-        inner.base_time = None;
-
-        if let Some(waker) = inner.waker.take() {
-            waker.wake();
-        }
-    }
-
-    pub fn shutdown(&self) {
-        // Paused->Ready
-        //
-        // Change state to Shutdown and signal task, wait for our future to be finished
-        // Requires scheduled function to be unblocked! Pad must be deactivated before
-
-        let mut inner = self.0.lock().unwrap();
-        gst_debug!(SOCKET_CAT, obj: &inner.element, "Shutting down socket");
-        if inner.state == SocketState::Unscheduled {
-            gst_debug!(SOCKET_CAT, obj: &inner.element, "Socket already shut down");
-            return;
-        }
-
-        assert!(inner.state == SocketState::Scheduled || inner.state == SocketState::Running);
-        inner.state = SocketState::Shutdown;
-
-        if let Some(waker) = inner.waker.take() {
-            waker.wake();
-        }
-
-        let shutdown_receiver = inner.shutdown_receiver.take().unwrap();
-        gst_debug!(SOCKET_CAT, obj: &inner.element, "Waiting for socket to shut down");
-        drop(inner);
-
-        tokio_current_thread::block_on_all(shutdown_receiver).expect("Already shut down");
-
-        let mut inner = self.0.lock().unwrap();
-        inner.state = SocketState::Unscheduled;
-        let _ = inner.buffer_pool.set_active(false);
-        gst_debug!(SOCKET_CAT, obj: &inner.element, "Socket shut down");
     }
 }
 
@@ -229,68 +164,63 @@ impl<T: SocketRead + Unpin + 'static> Clone for Socket<T> {
     }
 }
 
-impl<T: SocketRead + 'static> Drop for SocketInner<T> {
-    fn drop(&mut self) {
-        assert_eq!(self.state, SocketState::Unscheduled);
-    }
+pub type SocketStreamItem =
+    Result<(gst::Buffer, Option<std::net::SocketAddr>), Either<gst::FlowError, io::Error>>;
+
+#[derive(Debug)]
+pub struct SocketStream<T: SocketRead + 'static> {
+    socket: Socket<T>,
+    mapped_buffer: Option<gst::MappedBuffer<gst::buffer::Writable>>,
 }
 
-struct SocketStream<T: SocketRead + 'static>(
-    Socket<T>,
-    Option<gst::MappedBuffer<gst::buffer::Writable>>,
-);
-
-impl<T: SocketRead + 'static> Stream for SocketStream<T> {
-    type Item =
-        Result<(gst::Buffer, Option<std::net::SocketAddr>), Either<gst::FlowError, io::Error>>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
-        // take the mapped_buffer before locking the socket so as to please the mighty borrow checker
-        let mut mapped_buffer = self.1.take();
-
-        let mut inner = (self.0).0.lock().unwrap();
-        if inner.state == SocketState::Shutdown {
-            gst_debug!(SOCKET_CAT, obj: &inner.element, "Socket shutting down");
-            return Poll::Ready(None);
-        } else if inner.state == SocketState::Scheduled {
-            gst_debug!(SOCKET_CAT, obj: &inner.element, "Socket not running");
-            inner.waker = Some(cx.waker().clone());
-            drop(inner);
-            self.1 = mapped_buffer;
-            return Poll::Pending;
+impl<T: SocketRead + 'static> SocketStream<T> {
+    fn new(socket: &Socket<T>) -> Self {
+        SocketStream {
+            socket: socket.clone(),
+            mapped_buffer: None,
         }
+    }
 
-        assert_eq!(inner.state, SocketState::Running);
+    // Implementing `next` as an `async fn` instead of a `Stream` because of the `async` `Mutex`
+    // See https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs/merge_requests/204#note_322774
+    #[allow(clippy::should_implement_trait)]
+    pub async fn next(&mut self) -> Option<SocketStreamItem> {
+        // take the mapped_buffer before locking the socket so as to please the mighty borrow checker
+        let (reader, wake_receiver) = {
+            let mut inner = self.socket.0.lock().await;
 
-        gst_debug!(SOCKET_CAT, obj: &inner.element, "Trying to read data");
-        let (len, saddr, time) = {
-            let buffer = match mapped_buffer {
-                Some(ref mut buffer) => buffer,
-                None => match inner.buffer_pool.acquire_buffer(None) {
+            if inner.state != SocketState::Started {
+                gst_debug!(SOCKET_CAT, obj: &inner.element, "DataQueue is not Started");
+                return None;
+            }
+
+            gst_debug!(SOCKET_CAT, obj: &inner.element, "Trying to read data");
+            if self.mapped_buffer.is_none() {
+                match inner.buffer_pool.acquire_buffer(None) {
                     Ok(buffer) => {
-                        mapped_buffer = Some(buffer.into_mapped_buffer_writable().unwrap());
-                        mapped_buffer.as_mut().unwrap()
+                        self.mapped_buffer = Some(buffer.into_mapped_buffer_writable().unwrap());
                     }
                     Err(err) => {
                         gst_debug!(SOCKET_CAT, obj: &inner.element, "Failed to acquire buffer {:?}", err);
-                        return Poll::Ready(Some(Err(Either::Left(err))));
+                        return Some(Err(Either::Left(err)));
                     }
-                },
-            };
+                }
+            }
 
-            match inner.reader.as_mut().poll_read(cx, buffer.as_mut_slice()) {
-                Poll::Pending => {
-                    gst_debug!(SOCKET_CAT, obj: &inner.element, "No data available");
-                    inner.waker = Some(cx.waker().clone());
-                    drop(inner);
-                    self.1 = mapped_buffer;
-                    return Poll::Pending;
-                }
-                Poll::Ready(Err(err)) => {
-                    gst_debug!(SOCKET_CAT, obj: &inner.element, "Read error {:?}", err);
-                    return Poll::Ready(Some(Err(Either::Right(err))));
-                }
-                Poll::Ready(Ok((len, saddr))) => {
+            let (sender, wake_receiver) = oneshot::channel();
+            inner.wake_sender = Some(sender);
+
+            (inner.reader.take().unwrap(), wake_receiver)
+        };
+
+        let read_fut = reader.read(self.mapped_buffer.as_mut().unwrap().as_mut_slice());
+
+        select! {
+            // Reader
+            item = read_fut.fuse() => match item {
+                Ok((len, saddr)) => {
+                    let mut inner = self.socket.0.lock().await;
+
                     let dts = if T::DO_TIMESTAMP {
                         let time = inner.clock.as_ref().unwrap().get_time();
                         let running_time = time - inner.base_time.unwrap();
@@ -300,20 +230,36 @@ impl<T: SocketRead + 'static> Stream for SocketStream<T> {
                         gst_debug!(SOCKET_CAT, obj: &inner.element, "Read {} bytes", len);
                         gst::CLOCK_TIME_NONE
                     };
-                    (len, saddr, dts)
+
+                    let mut buffer = self.mapped_buffer.take().unwrap().into_buffer();
+                    {
+                        let buffer = buffer.get_mut().unwrap();
+                        if len < buffer.get_size() {
+                            buffer.set_size(len);
+                        }
+                        buffer.set_dts(dts);
+                    }
+
+                    inner.reader = Some(reader);
+
+                    Some(Ok((buffer, saddr)))
                 }
-            }
-        };
+                Err(err) => {
+                    let mut inner = self.socket.0.lock().await;
+                    gst_debug!(SOCKET_CAT, obj: &inner.element, "Read error {:?}", err);
+                    inner.reader = Some(reader);
 
-        let mut buffer = mapped_buffer.unwrap().into_buffer();
-        {
-            let buffer = buffer.get_mut().unwrap();
-            if len < buffer.get_size() {
-                buffer.set_size(len);
+                    Some(Err(Either::Right(err)))
+                }
+            },
+            // Waker: called for State changes
+            _ = wake_receiver.fuse() => {
+                let mut inner = self.socket.0.lock().await;
+                gst_debug!(SOCKET_CAT, obj: &inner.element, "Socket awaken");
+                inner.reader = Some(reader);
+
+                None
             }
-            buffer.set_dts(time);
         }
-
-        Poll::Ready(Some(Ok((buffer, saddr))))
     }
 }
