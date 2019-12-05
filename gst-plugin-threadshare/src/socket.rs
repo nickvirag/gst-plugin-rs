@@ -18,11 +18,8 @@
 
 use either::Either;
 
-use futures::channel::oneshot;
-use futures::future::BoxFuture;
+use futures::future::{abortable, AbortHandle, Aborted, BoxFuture};
 use futures::lock::Mutex;
-use futures::prelude::*;
-use futures::select;
 
 use gst;
 use gst::prelude::*;
@@ -65,17 +62,11 @@ enum SocketState {
 struct SocketInner<T: SocketRead + 'static> {
     state: SocketState,
     element: gst::Element,
-    reader: Option<T>,
+    reader: T,
     buffer_pool: gst::BufferPool,
     clock: Option<gst::Clock>,
     base_time: Option<gst::ClockTime>,
-    wake_sender: Option<oneshot::Sender<()>>,
-}
-
-impl<T: SocketRead + 'static> SocketInner<T> {
-    fn wake(&mut self) {
-        self.wake_sender.take();
-    }
+    read_handle: Option<AbortHandle>,
 }
 
 impl<T: SocketRead + 'static> Socket<T> {
@@ -83,11 +74,11 @@ impl<T: SocketRead + 'static> Socket<T> {
         Socket(Arc::new(Mutex::new(SocketInner::<T> {
             state: SocketState::Unprepared,
             element: element.clone(),
-            reader: Some(reader),
+            reader,
             buffer_pool,
             clock: None,
             base_time: None,
-            wake_sender: None,
+            read_handle: None,
         })))
     }
 
@@ -121,7 +112,6 @@ impl<T: SocketRead + 'static> Socket<T> {
         inner.clock = clock;
         inner.base_time = base_time;
         inner.state = SocketState::Started;
-        inner.wake();
     }
 
     pub async fn pause(&self) {
@@ -137,7 +127,9 @@ impl<T: SocketRead + 'static> Socket<T> {
         inner.clock = None;
         inner.base_time = None;
         inner.state = SocketState::Paused;
-        inner.wake();
+        if let Some(read_handle) = inner.read_handle.take() {
+            read_handle.abort();
+        }
     }
 
     pub async fn unprepare(&self) -> Result<(), ()> {
@@ -186,9 +178,8 @@ impl<T: SocketRead + 'static> SocketStream<T> {
     #[allow(clippy::should_implement_trait)]
     pub async fn next(&mut self) -> Option<SocketStreamItem> {
         // take the mapped_buffer before locking the socket so as to please the mighty borrow checker
-        let (reader, wake_receiver) = {
+        let read_fut = {
             let mut inner = self.socket.0.lock().await;
-
             if inner.state != SocketState::Started {
                 gst_debug!(SOCKET_CAT, obj: &inner.element, "DataQueue is not Started");
                 return None;
@@ -207,56 +198,48 @@ impl<T: SocketRead + 'static> SocketStream<T> {
                 }
             }
 
-            let (sender, wake_receiver) = oneshot::channel();
-            inner.wake_sender = Some(sender);
+            let (read_fut, abort_handle) = abortable(
+                inner
+                    .reader
+                    .read(self.mapped_buffer.as_mut().unwrap().as_mut_slice()),
+            );
+            inner.read_handle = Some(abort_handle);
 
-            (inner.reader.take().unwrap(), wake_receiver)
+            read_fut
         };
 
-        let read_fut = reader.read(self.mapped_buffer.as_mut().unwrap().as_mut_slice());
+        match read_fut.await {
+            Ok(Ok((len, saddr))) => {
+                let inner = self.socket.0.lock().await;
 
-        select! {
-            // Reader
-            item = read_fut.fuse() => match item {
-                Ok((len, saddr)) => {
-                    let mut inner = self.socket.0.lock().await;
+                let dts = if T::DO_TIMESTAMP {
+                    let time = inner.clock.as_ref().unwrap().get_time();
+                    let running_time = time - inner.base_time.unwrap();
+                    gst_debug!(SOCKET_CAT, obj: &inner.element, "Read {} bytes at {} (clock {})", len, running_time, time);
+                    running_time
+                } else {
+                    gst_debug!(SOCKET_CAT, obj: &inner.element, "Read {} bytes", len);
+                    gst::CLOCK_TIME_NONE
+                };
 
-                    let dts = if T::DO_TIMESTAMP {
-                        let time = inner.clock.as_ref().unwrap().get_time();
-                        let running_time = time - inner.base_time.unwrap();
-                        gst_debug!(SOCKET_CAT, obj: &inner.element, "Read {} bytes at {} (clock {})", len, running_time, time);
-                        running_time
-                    } else {
-                        gst_debug!(SOCKET_CAT, obj: &inner.element, "Read {} bytes", len);
-                        gst::CLOCK_TIME_NONE
-                    };
-
-                    let mut buffer = self.mapped_buffer.take().unwrap().into_buffer();
-                    {
-                        let buffer = buffer.get_mut().unwrap();
-                        if len < buffer.get_size() {
-                            buffer.set_size(len);
-                        }
-                        buffer.set_dts(dts);
+                let mut buffer = self.mapped_buffer.take().unwrap().into_buffer();
+                {
+                    let buffer = buffer.get_mut().unwrap();
+                    if len < buffer.get_size() {
+                        buffer.set_size(len);
                     }
-
-                    inner.reader = Some(reader);
-
-                    Some(Ok((buffer, saddr)))
+                    buffer.set_dts(dts);
                 }
-                Err(err) => {
-                    let mut inner = self.socket.0.lock().await;
-                    gst_debug!(SOCKET_CAT, obj: &inner.element, "Read error {:?}", err);
-                    inner.reader = Some(reader);
 
-                    Some(Err(Either::Right(err)))
-                }
-            },
-            // Waker: called for State changes
-            _ = wake_receiver.fuse() => {
-                let mut inner = self.socket.0.lock().await;
-                gst_debug!(SOCKET_CAT, obj: &inner.element, "Socket awaken");
-                inner.reader = Some(reader);
+                Some(Ok((buffer, saddr)))
+            }
+            Ok(Err(err)) => {
+                gst_debug!(SOCKET_CAT, obj: &self.socket.0.lock().await.element, "Read error {:?}", err);
+
+                Some(Err(Either::Right(err)))
+            }
+            Err(Aborted) => {
+                gst_debug!(SOCKET_CAT, obj: &self.socket.0.lock().await.element, "Read Aborted");
 
                 None
             }

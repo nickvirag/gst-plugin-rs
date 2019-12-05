@@ -15,7 +15,7 @@
 // Free Software Foundation, Inc., 51 Franklin Street, Suite 500,
 // Boston, MA 02110-1335, USA.
 
-use futures::channel::oneshot;
+use futures::future::{self, abortable, AbortHandle};
 use futures::lock::Mutex;
 
 use gst;
@@ -90,12 +90,14 @@ struct DataQueueInner {
     max_size_bytes: Option<u32>,
     max_size_time: Option<u64>,
 
-    wake_sender: Option<oneshot::Sender<()>>,
+    pending_handle: Option<AbortHandle>,
 }
 
 impl DataQueueInner {
     fn wake(&mut self) {
-        self.wake_sender.take();
+        if let Some(pending_handle) = self.pending_handle.take() {
+            pending_handle.abort();
+        }
     }
 }
 
@@ -117,7 +119,7 @@ impl DataQueue {
             max_size_buffers,
             max_size_bytes,
             max_size_time,
-            wake_sender: None,
+            pending_handle: None,
         })))
     }
 
@@ -141,6 +143,7 @@ impl DataQueue {
         gst_debug!(DATA_QUEUE_CAT, obj: &inner.element, "Pausing data queue");
         assert_eq!(DataQueueState::Started, inner.state);
         inner.state = DataQueueState::Paused;
+        inner.wake();
     }
 
     pub async fn stop(&self) {
@@ -237,17 +240,12 @@ impl DataQueue {
     #[allow(clippy::should_implement_trait)]
     pub async fn next(&mut self) -> Option<DataQueueItem> {
         loop {
-            let wake_receiver = {
+            let pending_fut = {
                 let mut inner = self.0.lock().await;
-
                 match inner.state {
                     DataQueueState::Started => match inner.queue.pop_front() {
                         None => {
                             gst_debug!(DATA_QUEUE_CAT, obj: &inner.element, "Data queue is empty");
-                            let (sender, receiver) = oneshot::channel();
-                            inner.wake_sender = Some(sender);
-
-                            receiver
                         }
                         Some(item) => {
                             gst_debug!(DATA_QUEUE_CAT, obj: &inner.element, "Popped item {:?}", item);
@@ -261,19 +259,21 @@ impl DataQueue {
                     },
                     DataQueueState::Paused => {
                         gst_debug!(DATA_QUEUE_CAT, obj: &inner.element, "Data queue Paused");
-                        let (sender, receiver) = oneshot::channel();
-                        inner.wake_sender = Some(sender);
-
-                        receiver
+                        return None;
                     }
                     DataQueueState::Stopped => {
                         gst_debug!(DATA_QUEUE_CAT, obj: &inner.element, "Data queue Stopped");
                         return None;
                     }
                 }
+
+                let (pending_fut, abort_handle) = abortable(future::pending::<()>());
+                inner.pending_handle = Some(abort_handle);
+
+                pending_fut
             };
 
-            let _ = wake_receiver.await;
+            let _ = pending_fut.await;
         }
     }
 }

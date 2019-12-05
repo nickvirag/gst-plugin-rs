@@ -17,10 +17,21 @@
 
 use gst;
 use gst::prelude::*;
+use gst::{gst_debug, gst_error};
+
+use lazy_static::lazy_static;
 
 use std::sync::mpsc;
 
 use gstthreadshare;
+
+lazy_static! {
+    static ref CAT: gst::DebugCategory = gst::DebugCategory::new(
+        "ts-test",
+        gst::DebugColorFlags::empty(),
+        Some("Thread-sharing test"),
+    );
+}
 
 fn init() {
     use std::sync::Once;
@@ -33,9 +44,10 @@ fn init() {
 }
 
 #[test]
-fn test_multiple_contexts() {
+fn multiple_contexts_queue() {
     use std::net;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::mpsc;
 
     init();
 
@@ -43,11 +55,12 @@ fn test_multiple_contexts() {
     const SRC_NB: u16 = 4;
     const CONTEXT_WAIT: u32 = 1;
     const BUFFER_NB: u32 = 3;
+    const FIRST_PORT: u16 = 40000;
 
     let l = glib::MainLoop::new(None, false);
     let pipeline = gst::Pipeline::new(None);
 
-    let mut src_list = Vec::<gst::Element>::new();
+    let (sender, receiver) = mpsc::channel();
 
     for i in 0..SRC_NB {
         let src =
@@ -55,7 +68,8 @@ fn test_multiple_contexts() {
         src.set_property("context", &format!("context-{}", (i as u32) % CONTEXT_NB))
             .unwrap();
         src.set_property("context-wait", &CONTEXT_WAIT).unwrap();
-        src.set_property("port", &(40000u32 + (i as u32))).unwrap();
+        src.set_property("port", &((FIRST_PORT + i) as u32))
+            .unwrap();
 
         let queue =
             gst::ElementFactory::make("ts-queue", Some(format!("queue-{}", i).as_str())).unwrap();
@@ -64,18 +78,17 @@ fn test_multiple_contexts() {
             .unwrap();
         queue.set_property("context-wait", &CONTEXT_WAIT).unwrap();
 
-        let appsink =
+        let sink =
             gst::ElementFactory::make("appsink", Some(format!("sink-{}", i).as_str())).unwrap();
+        sink.set_property("sync", &false).unwrap();
+        sink.set_property("async", &false).unwrap();
+        sink.set_property("emit-signals", &true).unwrap();
 
-        pipeline.add_many(&[&src, &queue, &appsink]).unwrap();
-        gst::Element::link_many(&[&src, &queue, &appsink]).unwrap();
+        pipeline.add_many(&[&src, &queue, &sink]).unwrap();
+        gst::Element::link_many(&[&src, &queue, &sink]).unwrap();
 
-        appsink.set_property("emit-signals", &true).unwrap();
-        appsink
-            .set_property("async", &glib::Value::from(&false))
-            .unwrap();
-
-        let appsink = appsink.dynamic_cast::<gst_app::AppSink>().unwrap();
+        let appsink = sink.dynamic_cast::<gst_app::AppSink>().unwrap();
+        let sender_clone = sender.clone();
         appsink.connect_new_sample(move |appsink| {
             let _sample = appsink
                 .emit("pull-sample", &[])
@@ -85,10 +98,9 @@ fn test_multiple_contexts() {
                 .unwrap()
                 .unwrap();
 
+            sender_clone.send(()).unwrap();
             Ok(gst::FlowSuccess::Ok)
         });
-
-        src_list.push(src);
     }
 
     let pipeline_clone = pipeline.clone();
@@ -98,26 +110,25 @@ fn test_multiple_contexts() {
         let socket = net::UdpSocket::bind("0.0.0.0:0").unwrap();
 
         let ipaddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-        let destinations = (40000..(40000 + SRC_NB))
+        let destinations = (FIRST_PORT..(FIRST_PORT + SRC_NB))
             .map(|port| SocketAddr::new(ipaddr, port))
             .collect::<Vec<_>>();
 
-        let wait = std::time::Duration::from_millis(CONTEXT_WAIT as u64);
-
         for _ in 0..BUFFER_NB {
-            let now = std::time::Instant::now();
-
             for dest in &destinations {
+                gst_debug!(CAT, "multiple_contexts_queue: sending buffer to {:?}", dest);
                 socket.send_to(&buffer, dest).unwrap();
-            }
-
-            let elapsed = now.elapsed();
-            if elapsed < wait {
-                std::thread::sleep(wait - elapsed);
+                std::thread::sleep(std::time::Duration::from_millis(CONTEXT_WAIT as u64));
             }
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        gst_debug!(
+            CAT,
+            "multiple_contexts_queue: waiting for all buffers notifications"
+        );
+        for _ in 0..(BUFFER_NB * (SRC_NB as u32)) {
+            receiver.recv().unwrap();
+        }
 
         pipeline_clone.set_state(gst::State::Null).unwrap();
         l_clone.quit();
@@ -143,8 +154,9 @@ fn test_multiple_contexts() {
                 }
             }
             MessageView::Error(err) => {
-                println!(
-                    "Error from {:?}: {} ({:?})",
+                gst_error!(
+                    CAT,
+                    "multiple_contexts_queue: Error from {:?}: {} ({:?})",
                     err.get_src().map(|s| s.get_path_string()),
                     err.get_error(),
                     err.get_debug()
@@ -159,13 +171,13 @@ fn test_multiple_contexts() {
 
     pipeline.set_state(gst::State::Playing).unwrap();
 
-    println!("starting...");
-
+    gst_debug!(CAT, "Starting main loop for multiple_contexts_queue...");
     l.run();
+    gst_debug!(CAT, "Stopping main loop for multiple_contexts_queue...");
 }
 
 #[test]
-fn test_multiple_contexts_proxy() {
+fn multiple_contexts_proxy() {
     use std::net;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -175,47 +187,67 @@ fn test_multiple_contexts_proxy() {
     const SRC_NB: u16 = 4;
     const CONTEXT_WAIT: u32 = 1;
     const BUFFER_NB: u32 = 3;
+    // Don't overlap with `multiple_contexts_queue`
+    const OFFSET: u16 = 10;
+    const FIRST_PORT: u16 = 40000 + OFFSET;
 
     let l = glib::MainLoop::new(None, false);
     let pipeline = gst::Pipeline::new(None);
 
-    let mut src_list = Vec::<gst::Element>::new();
+    let (sender, receiver) = mpsc::channel();
 
     for i in 0..SRC_NB {
-        let src =
-            gst::ElementFactory::make("ts-udpsrc", Some(format!("src-{}", i).as_str())).unwrap();
+        let pipeline_index = i + OFFSET;
+
+        let src = gst::ElementFactory::make(
+            "ts-udpsrc",
+            Some(format!("src-{}", pipeline_index).as_str()),
+        )
+        .unwrap();
         src.set_property("context", &format!("context-{}", (i as u32) % CONTEXT_NB))
             .unwrap();
         src.set_property("context-wait", &CONTEXT_WAIT).unwrap();
-        src.set_property("port", &(40000u32 + (i as u32))).unwrap();
+        src.set_property("port", &((FIRST_PORT + i) as u32))
+            .unwrap();
 
-        let proxysink = gst::ElementFactory::make("ts-proxysink", None).unwrap();
+        let proxysink = gst::ElementFactory::make(
+            "ts-proxysink",
+            Some(format!("proxysink-{}", pipeline_index).as_str()),
+        )
+        .unwrap();
         proxysink
-            .set_property("proxy-context", &format!("proxy-{}", i))
+            .set_property("proxy-context", &format!("proxy-{}", pipeline_index))
             .unwrap();
-        let proxysrc = gst::ElementFactory::make("ts-proxysrc", None).unwrap();
+        let proxysrc = gst::ElementFactory::make(
+            "ts-proxysrc",
+            Some(format!("proxysrc-{}", pipeline_index).as_str()),
+        )
+        .unwrap();
         proxysrc
-            .set_property("context", &format!("context-{}", (i as u32) % CONTEXT_NB))
+            .set_property(
+                "context",
+                &format!("context-{}", (pipeline_index as u32) % CONTEXT_NB),
+            )
             .unwrap();
         proxysrc
-            .set_property("proxy-context", &format!("proxy-{}", i))
+            .set_property("proxy-context", &format!("proxy-{}", pipeline_index))
             .unwrap();
 
-        let appsink =
-            gst::ElementFactory::make("appsink", Some(format!("sink-{}", i).as_str())).unwrap();
+        let sink =
+            gst::ElementFactory::make("appsink", Some(format!("sink-{}", pipeline_index).as_str()))
+                .unwrap();
+        sink.set_property("sync", &false).unwrap();
+        sink.set_property("async", &false).unwrap();
+        sink.set_property("emit-signals", &true).unwrap();
 
         pipeline
-            .add_many(&[&src, &proxysink, &proxysrc, &appsink])
+            .add_many(&[&src, &proxysink, &proxysrc, &sink])
             .unwrap();
         src.link(&proxysink).unwrap();
-        proxysrc.link(&appsink).unwrap();
+        proxysrc.link(&sink).unwrap();
 
-        appsink.set_property("emit-signals", &true).unwrap();
-        appsink
-            .set_property("async", &glib::Value::from(&false))
-            .unwrap();
-
-        let appsink = appsink.dynamic_cast::<gst_app::AppSink>().unwrap();
+        let appsink = sink.dynamic_cast::<gst_app::AppSink>().unwrap();
+        let sender_clone = sender.clone();
         appsink.connect_new_sample(move |appsink| {
             let _sample = appsink
                 .emit("pull-sample", &[])
@@ -225,10 +257,9 @@ fn test_multiple_contexts_proxy() {
                 .unwrap()
                 .unwrap();
 
+            sender_clone.send(()).unwrap();
             Ok(gst::FlowSuccess::Ok)
         });
-
-        src_list.push(src);
     }
 
     let pipeline_clone = pipeline.clone();
@@ -238,26 +269,25 @@ fn test_multiple_contexts_proxy() {
         let socket = net::UdpSocket::bind("0.0.0.0:0").unwrap();
 
         let ipaddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-        let destinations = (40000..(40000 + SRC_NB))
+        let destinations = (FIRST_PORT..(FIRST_PORT + SRC_NB))
             .map(|port| SocketAddr::new(ipaddr, port))
             .collect::<Vec<_>>();
 
-        let wait = std::time::Duration::from_millis(CONTEXT_WAIT as u64);
-
         for _ in 0..BUFFER_NB {
-            let now = std::time::Instant::now();
-
             for dest in &destinations {
+                gst_debug!(CAT, "multiple_contexts_proxy: sending buffer to {:?}", dest);
                 socket.send_to(&buffer, dest).unwrap();
-            }
-
-            let elapsed = now.elapsed();
-            if elapsed < wait {
-                std::thread::sleep(wait - elapsed);
+                std::thread::sleep(std::time::Duration::from_millis(CONTEXT_WAIT as u64));
             }
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        gst_debug!(
+            CAT,
+            "multiple_contexts_proxy: waiting for all buffers notifications"
+        );
+        for _ in 0..(BUFFER_NB * (SRC_NB as u32)) {
+            receiver.recv().unwrap();
+        }
 
         pipeline_clone.set_state(gst::State::Null).unwrap();
         l_clone.quit();
@@ -283,8 +313,9 @@ fn test_multiple_contexts_proxy() {
                 }
             }
             MessageView::Error(err) => {
-                println!(
-                    "Error from {:?}: {} ({:?})",
+                gst_error!(
+                    CAT,
+                    "multiple_contexts_proxy: Error from {:?}: {} ({:?})",
                     err.get_src().map(|s| s.get_path_string()),
                     err.get_error(),
                     err.get_debug()
@@ -299,12 +330,13 @@ fn test_multiple_contexts_proxy() {
 
     pipeline.set_state(gst::State::Playing).unwrap();
 
-    println!("starting...");
+    gst_debug!(CAT, "Starting main loop for multiple_contexts_proxy...");
     l.run();
+    gst_debug!(CAT, "Stopping main loop for multiple_contexts_proxy...");
 }
 
 #[test]
-fn test_eos() {
+fn eos() {
     const CONTEXT: &str = "test_eos";
 
     init();
@@ -314,29 +346,28 @@ fn test_eos() {
 
     let caps = gst::Caps::new_simple("foo/bar", &[]);
 
-    let src = gst::ElementFactory::make("ts-appsrc", Some("ts-appsrc")).unwrap();
+    let src = gst::ElementFactory::make("ts-appsrc", Some("src-eos")).unwrap();
     src.set_property("caps", &caps).unwrap();
     src.set_property("do-timestamp", &true).unwrap();
     src.set_property("context", &CONTEXT).unwrap();
 
-    let queue = gst::ElementFactory::make("ts-queue", None).unwrap();
+    let queue = gst::ElementFactory::make("ts-queue", Some("queue-eos")).unwrap();
     queue.set_property("context", &CONTEXT).unwrap();
 
-    let appsink = gst::ElementFactory::make("appsink", None).unwrap();
+    let appsink = gst::ElementFactory::make("appsink", Some("sink-eos")).unwrap();
 
     pipeline.add_many(&[&src, &queue, &appsink]).unwrap();
     gst::Element::link_many(&[&src, &queue, &appsink]).unwrap();
 
-    appsink.set_property("emit-signals", &true).unwrap();
-    appsink
-        .set_property("async", &glib::Value::from(&false))
-        .unwrap();
+    appsink.set_property("sync", &false).unwrap();
+    appsink.set_property("async", &false).unwrap();
 
+    appsink.set_property("emit-signals", &true).unwrap();
     let (sample_notifier, sample_notif_rcv) = mpsc::channel();
     let (eos_notifier, eos_notif_rcv) = mpsc::channel();
-
     let appsink = appsink.dynamic_cast::<gst_app::AppSink>().unwrap();
     appsink.connect_new_sample(move |appsink| {
+        gst_debug!(CAT, obj: appsink, "eos: pulling sample");
         let _ = appsink
             .emit("pull-sample", &[])
             .unwrap()
@@ -353,6 +384,7 @@ fn test_eos() {
     appsink.connect_eos(move |_appsink| eos_notifier.send(()).unwrap());
 
     fn push_buffer(src: &gst::Element) -> bool {
+        gst_debug!(CAT, obj: src, "eos: pushing buffer");
         src.emit("push-buffer", &[&gst::Buffer::from_slice(vec![0; 1024])])
             .unwrap()
             .unwrap()
@@ -408,8 +440,9 @@ fn test_eos() {
                 }
             }
             MessageView::Error(err) => {
-                println!(
-                    "Error from {:?}: {} ({:?})",
+                gst_error!(
+                    CAT,
+                    "eos: Error from {:?}: {} ({:?})",
                     err.get_src().map(|s| s.get_path_string()),
                     err.get_error(),
                     err.get_debug()
@@ -424,13 +457,13 @@ fn test_eos() {
 
     pipeline.set_state(gst::State::Playing).unwrap();
 
-    println!("Starting main loop...");
+    gst_debug!(CAT, "Starting main loop for eos...");
     l.run();
-    println!("Stopped main loop");
+    gst_debug!(CAT, "Stopping main loop for eos...");
 }
 
 #[test]
-fn test_premature_shutdown() {
+fn premature_shutdown() {
     init();
 
     const APPSRC_CONTEXT_WAIT: u32 = 0;
@@ -442,14 +475,14 @@ fn test_premature_shutdown() {
 
     let caps = gst::Caps::new_simple("foo/bar", &[]);
 
-    let src = gst::ElementFactory::make("ts-appsrc", Some("ts-appsrc")).unwrap();
+    let src = gst::ElementFactory::make("ts-appsrc", Some("src-ps")).unwrap();
     src.set_property("caps", &caps).unwrap();
     src.set_property("do-timestamp", &true).unwrap();
     src.set_property("context", &"appsrc-context").unwrap();
     src.set_property("context-wait", &APPSRC_CONTEXT_WAIT)
         .unwrap();
 
-    let queue = gst::ElementFactory::make("ts-queue", None).unwrap();
+    let queue = gst::ElementFactory::make("ts-queue", Some("queue-ps")).unwrap();
     queue.set_property("context", &"queue-context").unwrap();
     queue
         .set_property("context-wait", &QUEUE_CONTEXT_WAIT)
@@ -458,20 +491,20 @@ fn test_premature_shutdown() {
         .set_property("max-size-buffers", &QUEUE_ITEMS_CAPACITY)
         .unwrap();
 
-    let appsink = gst::ElementFactory::make("appsink", None).unwrap();
+    let appsink = gst::ElementFactory::make("appsink", Some("sink-ps")).unwrap();
 
     pipeline.add_many(&[&src, &queue, &appsink]).unwrap();
     gst::Element::link_many(&[&src, &queue, &appsink]).unwrap();
 
     appsink.set_property("emit-signals", &true).unwrap();
-    appsink
-        .set_property("async", &glib::Value::from(&false))
-        .unwrap();
+    appsink.set_property("sync", &false).unwrap();
+    appsink.set_property("async", &false).unwrap();
 
     let (sender, receiver) = mpsc::channel();
 
     let appsink = appsink.dynamic_cast::<gst_app::AppSink>().unwrap();
     appsink.connect_new_sample(move |appsink| {
+        gst_debug!(CAT, obj: appsink, "premature_shutdown: pulling sample");
         let _sample = appsink
             .emit("pull-sample", &[])
             .unwrap()
@@ -486,6 +519,7 @@ fn test_premature_shutdown() {
     });
 
     fn push_buffer(src: &gst::Element) -> bool {
+        gst_debug!(CAT, obj: src, "premature_shutdown: pushing buffer");
         src.emit("push-buffer", &[&gst::Buffer::from_slice(vec![0; 1024])])
             .unwrap()
             .unwrap()
@@ -496,7 +530,7 @@ fn test_premature_shutdown() {
     let pipeline_clone = pipeline.clone();
     let l_clone = l.clone();
     let mut scenario = Some(move || {
-        println!("\n**** STEP 1: Playing");
+        gst_debug!(CAT, "premature_shutdown: STEP 1: Playing");
         // Initialize the dataflow
         assert!(push_buffer(&src));
 
@@ -511,23 +545,26 @@ fn test_premature_shutdown() {
         // Paused -> can't push_buffer
         assert!(!push_buffer(&src));
 
-        println!("\n**** STEP 2: Paused -> Playing");
+        gst_debug!(CAT, "premature_shutdown: STEP 2: Paused -> Playing");
         pipeline_clone.set_state(gst::State::Playing).unwrap();
 
-        println!("\n**** STEP 3: Playing");
+        gst_debug!(CAT, "premature_shutdown: STEP 3: Playing");
 
         receiver.recv().unwrap();
 
-        push_buffer(&src);
+        assert!(push_buffer(&src));
         receiver.recv().unwrap();
 
         // Fill up the (dataqueue) and abruptly shutdown
-        push_buffer(&src);
-        push_buffer(&src);
+        assert!(push_buffer(&src));
+        assert!(push_buffer(&src));
+
+        gst_debug!(CAT, "premature_shutdown: STEP 4: Shutdown");
 
         pipeline_clone.set_state(gst::State::Null).unwrap();
 
-        assert_eq!(receiver.try_recv().unwrap_err(), mpsc::TryRecvError::Empty);
+        assert!(!push_buffer(&src));
+
         l_clone.quit();
     });
 
@@ -551,8 +588,9 @@ fn test_premature_shutdown() {
                 }
             }
             MessageView::Error(err) => {
-                println!(
-                    "Error from {:?}: {} ({:?})",
+                gst_error!(
+                    CAT,
+                    "premature_shutdown: Error from {:?}: {} ({:?})",
                     err.get_src().map(|s| s.get_path_string()),
                     err.get_error(),
                     err.get_debug()
@@ -567,7 +605,7 @@ fn test_premature_shutdown() {
 
     pipeline.set_state(gst::State::Playing).unwrap();
 
-    println!("Starting main loop...");
+    gst_debug!(CAT, "Starting main loop for premature_shutdown...");
     l.run();
-    println!("Stopped main loop");
+    gst_debug!(CAT, "Stopped main loop for premature_shutdown...");
 }

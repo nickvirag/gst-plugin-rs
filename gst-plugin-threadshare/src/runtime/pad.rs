@@ -452,32 +452,27 @@ impl PadSrcStrong {
                 pad_ctx,
             );
 
-            let s = gst::Structure::new("ts-pad-context", &[("pad-context", &pad_ctx.downgrade())]);
-            self.gst_pad()
-                .push_event(gst::Event::new_custom_downstream_sticky(s).build());
+            self.gst_pad().push_event(pad_ctx.new_sticky_event());
         }
     }
 
     #[inline]
     async fn push(&self, buffer: gst::Buffer) -> Result<FlowSuccess, FlowError> {
-        let (success, pending_tasks) = {
-            let mut state = self.lock_state().await;
-            self.push_prelude(&mut state);
-            let success = self.gst_pad().push(buffer).map_err(|err| {
-                gst_error!(
-                    RUNTIME_CAT,
-                    obj: self.gst_pad(),
-                    "Failed to push Buffer to PadSrc: {:?} ({})",
-                    err,
-                    state.pad_context_priv(),
-                );
-                err
-            })?;
+        let mut state = self.lock_state().await;
+        self.push_prelude(&mut state);
 
-            (success, state.pad_context_priv().drain_pending_tasks())
-        };
+        gst_log!(RUNTIME_CAT, obj: self.gst_pad(), "Pushing buffer");
+        let success = self.gst_pad().push(buffer).map_err(|err| {
+            gst_error!(RUNTIME_CAT,
+                obj: self.gst_pad(),
+                "Failed to push Buffer to PadSrc: {:?}",
+                err,
+            );
+            err
+        })?;
 
-        if let Some(pending_tasks) = pending_tasks {
+        if let Some(pending_tasks) = state.pad_context_priv().drain_pending_tasks() {
+            gst_log!(RUNTIME_CAT, obj: self.gst_pad(), "Processing pending tasks (push)");
             pending_tasks.await?;
         }
 
@@ -486,24 +481,23 @@ impl PadSrcStrong {
 
     #[inline]
     async fn push_list(&self, list: gst::BufferList) -> Result<FlowSuccess, FlowError> {
-        let (success, pending_tasks) = {
-            let mut state = self.lock_state().await;
-            self.push_prelude(&mut state);
-            let success = self.gst_pad().push_list(list).map_err(|err| {
-                gst_error!(
-                    RUNTIME_CAT,
-                    obj: self.gst_pad(),
-                    "Failed to push BufferList to PadSrc: {:?} ({})",
-                    err,
-                    state.pad_context_priv(),
-                );
-                err
-            })?;
+        let mut state = self.lock_state().await;
+        self.push_prelude(&mut state);
 
-            (success, state.pad_context_priv().drain_pending_tasks())
-        };
+        gst_log!(RUNTIME_CAT, obj: self.gst_pad(), "Pushing buffer_list");
+        let success = self.gst_pad().push_list(list).map_err(|err| {
+            gst_error!(
+                RUNTIME_CAT,
+                obj: self.gst_pad(),
+                "Failed to push BufferList to PadSrc: {:?} ({})",
+                err,
+                state.pad_context_priv(),
+            );
+            err
+        })?;
 
-        if let Some(pending_tasks) = pending_tasks {
+        if let Some(pending_tasks) = state.pad_context_priv().drain_pending_tasks() {
+            gst_log!(RUNTIME_CAT, obj: self.gst_pad(), "Processing pending tasks (push_list)");
             pending_tasks.await?;
         }
 
@@ -512,15 +506,14 @@ impl PadSrcStrong {
 
     #[inline]
     async fn push_event(&self, event: gst::Event) -> bool {
-        let (was_handled, pending_tasks) = {
-            let mut state = self.lock_state().await;
-            self.push_prelude(&mut state);
-            let was_handled = self.gst_pad().push_event(event);
+        let mut state = self.lock_state().await;
+        self.push_prelude(&mut state);
 
-            (was_handled, state.pad_context_priv().drain_pending_tasks())
-        };
+        gst_log!(RUNTIME_CAT, obj: self.gst_pad(), "Pushing event");
+        let was_handled = self.gst_pad().push_event(event);
 
-        if let Some(pending_tasks) = pending_tasks {
+        if let Some(pending_tasks) = state.pad_context_priv().drain_pending_tasks() {
+            gst_log!(RUNTIME_CAT, obj: self.gst_pad(), "Processing pending tasks (push_event)");
             if pending_tasks.await.is_err() {
                 return false;
             }

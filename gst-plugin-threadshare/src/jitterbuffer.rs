@@ -949,7 +949,7 @@ impl JitterBuffer {
 
         let element = element.clone();
         let pad_ctx_weak = pad_ctx.downgrade();
-        let wakeup_fut = pad_ctx.delay_by(Duration::from_nanos(delay), move || {
+        let wakeup_fut = pad_ctx.delay_for(Duration::from_nanos(delay), move || {
             Self::wakeup_fut(latency_ns, context_wait_ns, element, pad_ctx_weak)
         });
 

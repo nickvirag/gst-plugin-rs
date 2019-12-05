@@ -317,9 +317,9 @@ impl SocketRead for UdpReader {
         let this = Arc::clone(&self.0);
 
         async move {
-            let mut this = this.lock().await;
-
-            this.socket
+            this.lock()
+                .await
+                .socket
                 .recv_from(buffer)
                 .await
                 .map(|(read_size, saddr)| (read_size, Some(saddr)))

@@ -46,7 +46,7 @@ impl PadContextWeak {
 }
 
 impl glib::subclass::boxed::BoxedType for PadContextWeak {
-    const NAME: &'static str = "TsTaskContext";
+    const NAME: &'static str = "TsPadContext";
 
     glib_boxed_type!();
 }
@@ -136,13 +136,13 @@ impl<'a> PadContextRef<'a> {
         self.strong.new_timeout(timeout)
     }
 
-    /// Builds a `Future` to execute an action after the given `delay` is elapsed.
-    pub fn delay_by<F, Fut>(&self, delay: Duration, f: F) -> impl Future<Output = Fut::Output>
+    /// Builds a `Future` to execute an action after the given `delay` has elapsed.
+    pub fn delay_for<F, Fut>(&self, delay: Duration, f: F) -> impl Future<Output = Fut::Output>
     where
         F: FnOnce() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.strong.delay_by(delay, f)
+        self.strong.delay_for(delay, f)
     }
 }
 
@@ -207,12 +207,12 @@ impl PadContextStrong {
     }
 
     #[inline]
-    pub fn delay_by<F, Fut>(&self, delay: Duration, f: F) -> impl Future<Output = Fut::Output>
+    pub fn delay_for<F, Fut>(&self, delay: Duration, f: F) -> impl Future<Output = Fut::Output>
     where
         F: FnOnce() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.context.delay_by(delay, f)
+        self.context.delay_for(delay, f)
     }
 }
 
@@ -280,13 +280,18 @@ impl PadContext {
         self.0.new_timeout(timeout)
     }
 
-    /// Builds a `Future` to execute an action after the given `delay` is elapsed.
-    pub fn delay_by<F, Fut>(&self, delay: Duration, f: F) -> impl Future<Output = Fut::Output>
+    /// Builds a `Future` to execute an action after the given `delay` has elapsed.
+    pub fn delay_for<F, Fut>(&self, delay: Duration, f: F) -> impl Future<Output = Fut::Output>
     where
         F: FnOnce() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.0.delay_by(delay, f)
+        self.0.delay_for(delay, f)
+    }
+
+    pub(super) fn new_sticky_event(&self) -> gst::Event {
+        let s = gst::Structure::new("ts-pad-context", &[("pad-context", &self.downgrade())]);
+        gst::Event::new_custom_downstream_sticky(s).build()
     }
 
     #[inline]

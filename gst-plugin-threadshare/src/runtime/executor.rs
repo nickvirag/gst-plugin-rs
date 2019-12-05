@@ -495,8 +495,8 @@ impl Context {
         Timeout::new(&self, timeout)
     }
 
-    /// Builds a `Future` to execute an action after the given `delay` is elapsed.
-    pub fn delay_by<F, Fut>(&self, delay: Duration, f: F) -> impl Future<Output = Fut::Output>
+    /// Builds a `Future` to execute an action after the given `delay` has elapsed.
+    pub fn delay_for<F, Fut>(&self, delay: Duration, f: F) -> impl Future<Output = Fut::Output>
     where
         F: FnOnce() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
@@ -657,15 +657,15 @@ mod tests {
     }
 
     #[test]
-    fn delay_by() {
+    fn delay_for() {
         gst::init().unwrap();
 
-        let context = Context::acquire("delay_by", SLEEP_DURATION).unwrap();
+        let context = Context::acquire("delay_for", SLEEP_DURATION).unwrap();
 
         let (sender, receiver) = oneshot::channel();
 
         let start = Instant::now();
-        let delayed_by_fut = context.delay_by(INTERVAL, move || {
+        let delayed_by_fut = context.delay_for(INTERVAL, move || {
             async {
                 sender.send(42).unwrap();
             }
@@ -679,22 +679,22 @@ mod tests {
     }
 
     #[test]
-    fn delay_by_abort() {
+    fn delay_for_abort() {
         gst::init().unwrap();
 
-        let context = Context::acquire("delay_by_abort", SLEEP_DURATION).unwrap();
+        let context = Context::acquire("delay_for_abort", SLEEP_DURATION).unwrap();
 
         let (sender, receiver) = oneshot::channel();
 
-        let delay_by_fut = context.delay_by(INTERVAL, move || {
+        let delay_for_fut = context.delay_for(INTERVAL, move || {
             async {
                 sender.send(42).unwrap();
             }
         });
-        let (abortable_delay_by, abort_handle) = abortable_waitable(delay_by_fut);
-        context.spawn(abortable_delay_by.map(move |res| {
+        let (abortable_delay_for, abort_handle) = abortable_waitable(delay_for_fut);
+        context.spawn(abortable_delay_for.map(move |res| {
             if let Err(Aborted) = res {
-                gst_debug!(RUNTIME_CAT, "Aborted delay_by");
+                gst_debug!(RUNTIME_CAT, "Aborted delay_for");
             }
         }));
 

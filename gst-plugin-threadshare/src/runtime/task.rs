@@ -215,3 +215,58 @@ impl Task {
         gst_debug!(RUNTIME_CAT, "Task Stopped");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use futures::channel::mpsc;
+    use futures::lock::Mutex;
+
+    use std::sync::Arc;
+
+    use crate::runtime::Context;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn task() {
+        gst::init().unwrap();
+
+        let context = Context::acquire("task", 2).unwrap();
+
+        let task = Task::default();
+        task.prepare(context).await.unwrap();
+
+        let (mut sender, receiver) = mpsc::channel(0);
+        let receiver = Arc::new(Mutex::new(receiver));
+
+        gst_debug!(RUNTIME_CAT, "task test: starting");
+        task.start(move || {
+            let receiver = Arc::clone(&receiver);
+            async move {
+                gst_debug!(RUNTIME_CAT, "task test: awaiting receiver");
+                match receiver.lock().await.next().await {
+                    Some(_) => gst_debug!(RUNTIME_CAT, "task test: item received"),
+                    None => gst_debug!(RUNTIME_CAT, "task test: channel complete"),
+                }
+            }
+        })
+        .await;
+
+        gst_debug!(RUNTIME_CAT, "task test: sending item");
+        sender.send(()).await.unwrap();
+        gst_debug!(RUNTIME_CAT, "task test: item sent");
+
+        gst_debug!(RUNTIME_CAT, "task test: pausing");
+        let pause_completion = task.pause().await;
+
+        gst_debug!(RUNTIME_CAT, "task test: dropping sender");
+        drop(sender);
+
+        gst_debug!(RUNTIME_CAT, "task test: awaiting pause completion");
+        pause_completion.await;
+
+        gst_debug!(RUNTIME_CAT, "task test: stopping");
+        task.stop().await;
+        gst_debug!(RUNTIME_CAT, "task test: stopped");
+    }
+}
