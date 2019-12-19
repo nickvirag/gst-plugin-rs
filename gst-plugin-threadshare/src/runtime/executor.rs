@@ -665,10 +665,8 @@ mod tests {
         let (sender, receiver) = oneshot::channel();
 
         let start = Instant::now();
-        let delayed_by_fut = context.delay_for(INTERVAL, move || {
-            async {
-                sender.send(42).unwrap();
-            }
+        let delayed_by_fut = context.delay_for(INTERVAL, move || async {
+            sender.send(42).unwrap();
         });
         context.spawn(delayed_by_fut);
 
@@ -686,10 +684,8 @@ mod tests {
 
         let (sender, receiver) = oneshot::channel();
 
-        let delay_for_fut = context.delay_for(INTERVAL, move || {
-            async {
-                sender.send(42).unwrap();
-            }
+        let delay_for_fut = context.delay_for(INTERVAL, move || async {
+            sender.send(42).unwrap();
         });
         let (abortable_delay_for, abort_handle) = abortable_waitable(delay_for_fut);
         context.spawn(abortable_delay_for.map(move |res| {
